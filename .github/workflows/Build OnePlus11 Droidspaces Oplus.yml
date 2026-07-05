@@ -1,0 +1,155 @@
+name: Build OnePlus11 Droidspaces Oplus
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  build:
+    name: oneplus_11_v_droidspaces_oplus
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      CPU: sm8550
+      FEIL: oneplus_11_v
+      DROIDSPACES_SLOT: "678"
+      STOCK_SUFFIX: android13-8-o-01129-ga500b44979e9
+      CCACHE_DIR: ${{ github.workspace }}/.ccache_oneplus11_droidspaces_oplus
+      CCACHE_MAXSIZE: 8G
+
+    steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          temp-reserve-mb: 4096
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends \
+            python3 git curl ccache libelf-dev build-essential flex bison libssl-dev \
+            libncurses-dev liblz4-tool zlib1g-dev libxml2-utils rsync unzip gawk \
+            dos2unix ca-certificates
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > /tmp/repo
+          chmod a+x /tmp/repo
+          sudo mv /tmp/repo /usr/local/bin/repo
+          ccache -M "$CCACHE_MAXSIZE"
+
+      - name: Configure git
+        run: |
+          git config --global user.name "codex-build"
+          git config --global user.email "codex-build@example.com"
+
+      - name: Restore ccache
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-${{ env.FEIL }}-droidspaces-oplus-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ env.FEIL }}-droidspaces-oplus-
+            ccache-${{ runner.os }}-${{ env.FEIL }}-
+
+      - name: Sync OnePlus kernel source
+        run: |
+          mkdir kernel_workspace
+          cd kernel_workspace
+          repo init -u https://github.com/Xiaomichael/kernel_manifest.git \
+            -b refs/heads/oneplus/${CPU} \
+            -m ${FEIL}.xml \
+            --depth=1
+          repo sync -c -j"$(nproc --all)" --no-tags --no-clone-bundle --force-sync
+
+      - name: Prepare source tree
+        run: |
+          set -e
+          cd kernel_workspace
+          rm -f kernel_platform/common/android/abi_gki_protected_exports_* || true
+          rm -f kernel_platform/msm-kernel/android/abi_gki_protected_exports_* || true
+
+          for tree in kernel_platform/common kernel_platform/msm-kernel kernel_platform/external/dtc; do
+            if [ -f "$tree/scripts/setlocalversion" ]; then
+              sed -i 's/ -dirty//g' "$tree/scripts/setlocalversion"
+              sed -i '$i res=$(echo "$res" | sed '\''s/-dirty//g'\'')' "$tree/scripts/setlocalversion"
+              sed -i "\$s|echo \"\$res\"|echo \"-${STOCK_SUFFIX}\"|" "$tree/scripts/setlocalversion"
+            fi
+          done
+
+      - name: Integrate Droidspaces support
+        run: |
+          set -e
+          cd kernel_workspace/kernel_platform/common
+          DEFCONFIG="./arch/arm64/configs/gki_defconfig"
+          git clone --depth 1 https://github.com/ravindu644/Droidspaces-OSS.git /tmp/Droidspaces-OSS
+          DROIDSPACES_PATCHES="/tmp/Droidspaces-OSS/Documentation/resources/kernel-patches/GKI"
+          SLOT_NAME=$(echo "$DROIDSPACES_SLOT" | sed 's/\(.\)/\1_/g; s/_$//')
+
+          PATCH_FILE="$DROIDSPACES_PATCHES/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_${SLOT_NAME}.patch"
+          echo "Applying Droidspaces kABI patch: $PATCH_FILE"
+          patch -p1 --forward < "$PATCH_FILE" || echo "Droidspaces kABI patch did not apply cleanly; continuing to build log"
+
+          enable_config() {
+            cfg="$1"
+            if grep -q "^${cfg}=y" "$DEFCONFIG"; then
+              echo "already enabled: $cfg"
+            elif grep -q "^# ${cfg} is not set" "$DEFCONFIG"; then
+              sed -i "s/^# ${cfg} is not set$/${cfg}=y/" "$DEFCONFIG"
+              echo "enabled disabled config: $cfg"
+            else
+              echo "${cfg}=y" >> "$DEFCONFIG"
+              echo "appended config: $cfg"
+            fi
+          }
+
+          enable_config CONFIG_SYSVIPC
+          enable_config CONFIG_POSIX_MQUEUE
+          enable_config CONFIG_IPC_NS
+          enable_config CONFIG_PID_NS
+          enable_config CONFIG_DEVTMPFS
+          enable_config CONFIG_NETFILTER_XT_MATCH_ADDRTYPE
+          enable_config CONFIG_TMPFS_XATTR
+          enable_config CONFIG_TMPFS_POSIX_ACL
+
+          echo "CONFIG_HEADERS_INSTALL=n" >> "$DEFCONFIG"
+          sed -i 's/check_defconfig//' ./build.config.gki
+
+      - name: Build kernel with Oplus script
+        run: |
+          set -e
+          export KBUILD_BUILD_USER="build-user"
+          export KBUILD_BUILD_HOST="build-host"
+          export KBUILD_BUILD_TIMESTAMP="Tue May 6 04:21:44 UTC 2025"
+          export PATH="$GITHUB_WORKSPACE/kernel_workspace/kernel_platform/prebuilts/clang/host/linux-x86/clang-r450784e/bin:/usr/lib/ccache:$PATH"
+          cd kernel_workspace
+          chmod +x kernel_platform/oplus/build/oplus_build_kernel.sh
+          ./kernel_platform/oplus/build/oplus_build_kernel.sh kalama gki
+          ccache -s
+
+      - name: Package artifacts
+        run: |
+          set -e
+          IMAGE_PATH=$(find "$GITHUB_WORKSPACE/kernel_workspace/kernel_platform" -name Image | head -n 1)
+          test -n "$IMAGE_PATH"
+          echo "Image path: $IMAGE_PATH"
+          mkdir -p out
+          cp "$IMAGE_PATH" out/Image
+          sha256sum out/Image | tee out/Image.sha256
+
+          git clone --depth 1 https://github.com/Xiaomichael/AnyKernel3.git AnyKernel3
+          rm -rf AnyKernel3/.git
+          cp out/Image AnyKernel3/Image
+          (cd AnyKernel3 && zip -q -r9 "$GITHUB_WORKSPACE/out/oneplus_11_v_droidspaces_oplus_ak3.zip" .)
+          sha256sum out/oneplus_11_v_droidspaces_oplus_ak3.zip | tee out/oneplus_11_v_droidspaces_oplus_ak3.zip.sha256
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: oneplus_11_v_droidspaces_oplus
+          path: out/*
