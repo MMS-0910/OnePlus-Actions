@@ -17,6 +17,7 @@ jobs:
       FEIL: oneplus_11_v
       DROIDSPACES_SLOT: "678"
       STOCK_SUFFIX: android13-8-o-01129-ga500b44979e9
+      MAKE_JOBS: "2"
       CCACHE_DIR: ${{ github.workspace }}/.ccache_oneplus11_droidspaces_oplus
       CCACHE_MAXSIZE: 8G
 
@@ -47,6 +48,15 @@ jobs:
         run: |
           git config --global user.name "codex-build"
           git config --global user.email "codex-build@example.com"
+
+      - name: Add swap for kernel build
+        run: |
+          set -e
+          sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
 
       - name: Restore ccache
         uses: actions/cache@v5
@@ -120,12 +130,23 @@ jobs:
           echo "CONFIG_HEADERS_INSTALL=n" >> "$DEFCONFIG"
           sed -i 's/check_defconfig//' ./build.config.gki
 
+      - name: Limit build resource usage
+        run: |
+          set -e
+          cd kernel_workspace/kernel_platform
+          grep -RIl 'MAKEFLAGS="-j$(nproc)' build oplus/build common/build.config* 2>/dev/null \
+            | xargs -r sed -i 's/MAKEFLAGS="-j$(nproc) ${MAKEFLAGS}"/MAKEFLAGS="-j${MAKE_JOBS} ${MAKEFLAGS}"/g'
+          grep -RIn 'MAKEFLAGS=' build oplus/build common/build.config* 2>/dev/null | head -n 50
+          free -h
+
       - name: Build kernel with Oplus script
         run: |
           set -e
           export KBUILD_BUILD_USER="build-user"
           export KBUILD_BUILD_HOST="build-host"
           export KBUILD_BUILD_TIMESTAMP="Tue May 6 04:21:44 UTC 2025"
+          export MAKEFLAGS="-j${MAKE_JOBS}"
+          export LTO=thin
           export PATH="$GITHUB_WORKSPACE/kernel_workspace/kernel_platform/prebuilts/clang/host/linux-x86/clang-r450784e/bin:/usr/lib/ccache:$PATH"
           cd kernel_workspace
           chmod +x kernel_platform/oplus/build/oplus_build_kernel.sh
